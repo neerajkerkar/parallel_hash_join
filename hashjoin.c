@@ -10,6 +10,9 @@
 #define MORSEL_SIZE 10000
 #define MAX_LINE_LEN 100
 #define MAX_TOKENS 3
+#define removeTag(ptr) (((long) ptr) & 0x0000FFFFFFFFFFFFl)
+#define TAG_MASK 0xFFFF000000000000l
+#define tag(hash) ((1l << (hash & 0x000000000000000Fl)) << 48)
 
 int sockets = 4;
 typedef char byte;
@@ -94,6 +97,8 @@ unsigned long hash(unsigned char *str, int len){
 }
 
 
+
+
 void insert(ht_entry *entry, ht_entry **hashTable, int hashMask){
 	int slot = entry->hash & hashMask;
 	//printf("hash %lx", entry->hash);
@@ -101,8 +106,8 @@ void insert(ht_entry *entry, ht_entry **hashTable, int hashMask){
 	ht_entry *new, *old;
 	do {
 		old = hashTable[slot];
-		entry->next = old;
-		new = entry;
+		entry->next = removeTag(old);
+		new = ((long) entry) | (((long) old) & TAG_MASK) | tag(entry->hash);
 	} while ( !CAS(&hashTable[slot], old, new));
 }
 
@@ -182,6 +187,7 @@ int incr_indices(int *indices,int *max, int n){
 	return c;
 }
 
+
 struct probe_task_args {
 	ht_entry ***hashTables;
 	int* hashMasks;
@@ -221,6 +227,7 @@ void task_probe(byte *morsel_start, int num_morsel_records, byte **local_storage
 	byte * cur_record = morsel_start;
 	int *indices = calloc(build_relns, sizeof(int)); 
 	//int *rec_ptr_offsets = malloc(sizeof(int)*build_relns);
+	//printf("build_relns %d\n",build_relns);
 	
 	for(int i = 0; i < num_morsel_records; i++){
 		int next_free_temp = 0;
@@ -229,46 +236,53 @@ void task_probe(byte *morsel_start, int num_morsel_records, byte **local_storage
 			long h = hash(cur_record + join_attr_offsets[j], join_attr_lens[j]);
 			int slot = h & hashMasks[j];
 			ht_entry **hashTable = hashTables[j];
-			ht_entry *entry = hashTable[slot];
-			while(entry != NULL){
-				if(h == entry->hash){
-					byte *other_record = entry->data;
-					
-					if(memcmp(cur_record + join_attr_offsets[j], other_record + build_attr_offsets[j], join_attr_lens[j])==0){
-						/*pthread_mutex_lock(&join_size_lock);
-						join_size++;
-						pthread_mutex_unlock(&join_size_lock);
-
-						memcpy(output_storage, cur_record, record_len);
-						memcpy(output_storage + record_len, other_record, build_record_len);
-						output_storage += record_len + build_record_len;*/
-						temp_area[next_free_temp++] = other_record;
-						match++;
+			//printf("tag %lx\n",tag(h));
+			if(tag(h) & ((long) hashTable[slot])){
+				ht_entry *entry = removeTag(hashTable[slot]);
+				while(entry != NULL){
+					if(h == entry->hash){
+						byte *other_record = entry->data;
 						
+						if(memcmp(cur_record + join_attr_offsets[j], other_record + build_attr_offsets[j], join_attr_lens[j])==0){
+							temp_area[next_free_temp++] = other_record;
+							match++;
+							
+						}
 					}
+					entry = entry->next;
 				}
-				entry = entry->next;
 			}
 			matches[j] = match;
+			//printf("match %d\n",match);
 		}
-		do {
-			memcpy(output_storage, cur_record, record_len);
-			output_storage += record_len;
-			int rec_off = 0;
-			for(int rel=0 ; rel < build_relns ; rel++){
-				memcpy(output_storage, temp_area[rec_off + indices[rel]], build_record_lens[rel]);
-				output_storage += build_record_lens[rel];
-				rec_off += matches[rel];
-			}
-				
-		} while(incr_indices(indices, matches, build_relns)!=1);
+		bool match_found = true;
+		for(int r=0;r<build_relns;r++){
+			if(matches[r]==0) match_found = false;
+		}
+		if(match_found){
+			do {
+				memcpy(output_storage, cur_record, record_len);
+				output_storage += record_len;
+				int rec_off = 0;
+				for(int rel=0 ; rel < build_relns ; rel++){
+					memcpy(output_storage, temp_area[rec_off + indices[rel]], build_record_lens[rel]);
+					output_storage += build_record_lens[rel];
+					rec_off += matches[rel];
+				}
+
+				/*pthread_mutex_lock(&join_size_lock);
+				join_size++;
+				pthread_mutex_unlock(&join_size_lock);*/
+					
+			} while(incr_indices(indices, matches, build_relns)!=1);
+		}
 		cur_record += record_len;
 	}
 	*local_storage = output_storage;
 }
 
 int dispatch(int socket, byte **local_storage, byte *temp_storage){
-	printf("dispatch\n");
+	//printf("dispatch\n");
 	int ret_val = 0;
 	bool task_found = false;
 	void (*task) (byte *, int, byte**, byte *, void **);
@@ -280,18 +294,25 @@ int dispatch(int socket, byte **local_storage, byte *temp_storage){
 	pthread_mutex_lock(&dispatcher_lock);
 	if(dispatcher_head != NULL){
 		job = dispatcher_head;
-		if(job->morsel_area_to_be_processed[socket] < job->morsel_area_sizes[socket]){
+		int morsel_socket_to_process = -1;
+		for(int sock = 0; sock < sockets; sock++){ //work stealing
+			if(job->morsel_area_to_be_processed[sock] < job->morsel_area_sizes[sock]){
+				morsel_socket_to_process = sock;
+			}
+			if(sock == socket) break;
+		}
+		if(morsel_socket_to_process != -1){
 			task_found = true;
 			task = job->qep->task_ptr;
 			args = job->task_args;
-			morsel_start = job->morsel_area_to_be_processed[socket] * job->inp_rec_size + job->morsel_areas[socket];
-			num_morsel_records = min(MORSEL_SIZE, job->morsel_area_sizes[socket] -  job->morsel_area_to_be_processed[socket]);
-			job->morsel_area_to_be_processed[socket] += num_morsel_records;
+			morsel_start = job->morsel_area_to_be_processed[morsel_socket_to_process] * job->inp_rec_size + job->morsel_areas[morsel_socket_to_process];
+			num_morsel_records = min(MORSEL_SIZE, job->morsel_area_sizes[morsel_socket_to_process] -  job->morsel_area_to_be_processed[morsel_socket_to_process]);
+			job->morsel_area_to_be_processed[morsel_socket_to_process] += num_morsel_records;
 			job->running_tasks++;
 		}
 	}
 	else {
-		printf("no job\n");
+		//printf("no job\n");
 		ret_val = -1;
 	}
 	pthread_mutex_unlock(&dispatcher_lock);
@@ -355,10 +376,11 @@ int dispatch(int socket, byte **local_storage, byte *temp_storage){
 	return ret_val;
 }
 	
-	
+pthread_mutex_t thread_print_lock; 
+
 void * worker_thread(void *closest_socket){
 	int socket = (int) closest_socket;
-	byte * local_storage = mmap(NULL, 2 * 100000 * sizeof(int) * 4, PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
+	byte * local_storage = mmap(NULL, 4 * 2 * 100000 * sizeof(int) * 4, PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
 	byte * temp_storage = mmap(NULL, 100000 * sizeof(int), PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
 	byte * local_storage_start = local_storage;	
 	while(1){
@@ -369,17 +391,23 @@ void * worker_thread(void *closest_socket){
 	//printf("few join result samples\n");
 	int l = 4 * sizeof(int);
 	byte *cr = local_storage_start;
-	int a,b,c,d;
-	//printf("(A,B) (C,A)\n");
-	while(cr < local_storage) {
-		memcpy(&a, cr, sizeof(int));
-		memcpy(&b, cr + sizeof(int), sizeof(int));
-		memcpy(&c, cr + 2*sizeof(int), sizeof(int));
-		memcpy(&d, cr + 3*sizeof(int), sizeof(int));
-		printf("%d,%d,%d,%d\n",a,b,c,d);
-		cr += sizeof(int)*4;
+	int total_rec_size = 0;
+	for(int r=0;r<next_metadata_free_slot;r++){
+		total_rec_size += metadata[r].rec_size;
 	}
-		
+	//printf("%d\n",total_rec_size);
+	pthread_mutex_lock(&thread_print_lock);
+	while(cr < local_storage) {
+		int * attr;
+		for(int a=0;a<total_rec_size/sizeof(int);a++){
+			attr = cr + a*sizeof(int);
+			if(a>0) printf(",");
+			printf("%d",*attr);
+		}
+		printf("\n");
+		cr += total_rec_size;
+	}
+	pthread_mutex_unlock(&thread_print_lock);
 }
 
 int get_hash_table_size(int recs){
@@ -443,13 +471,15 @@ void load_and_partition_relation(char *f){
 		meta.morsel_area_sizes[s] = num_records / sockets;
 	}
 	metadata[next_metadata_free_slot++] = meta;
+	//printf("%d recs loaded from file %s\n",num_records,f);
 }
 
 int main(int argc, char **argv){
-	int relations = (argc - 1)/2;
+	int relations = argc/2;
 	for(int r=0;r<relations;r++){
 		load_and_partition_relation(argv[1+r]);
 	}
+	//printf("relations %d\n",relations);
 	/*int rel1_len = 200000;
 	int rel2_len = 200000;
 	byte * rel1 = malloc(rel1_len * sizeof(int) * 2);
@@ -498,10 +528,10 @@ int main(int argc, char **argv){
 
 		probe_args.hashTables[c] = hashTable;
 		probe_args.hashMasks[c] = h_mask;
-		probe_args.build_attr_offsets[c] = c2;
+		probe_args.build_attr_offsets[c] = c2*sizeof(int);
 		probe_args.join_attr_lens[c] = sizeof(int);
 		probe_args.build_record_lens[c] = meta.rec_size;
-		probe_args.join_attr_offsets[c] = c1;
+		probe_args.join_attr_offsets[c] = c1*sizeof(int);
 		
 		void **args = malloc(sizeof(void *) * 5);
 		args[0] = hashTable;
@@ -510,7 +540,7 @@ int main(int argc, char **argv){
 		args[3] = sizeof(int);
 		args[4] = meta.rec_size;
 		job->task_args = args;
-		printf("adding job\n");
+		//printf("adding job\n");
 		if(dispatcher_tail == NULL){
 			dispatcher_head = job;
 			dispatcher_tail = job;
